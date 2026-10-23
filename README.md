@@ -1,478 +1,249 @@
-# CausalGBM: Fairness via Causal Feature Selection for Gradient Boosting
+# CausalGBM: Achieving Fairness in Tabular Classification via Causal Feature Selection
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**CausalGBM** is a two-stage framework that achieves fairness in tabular classification by automatically identifying and removing proxy features using causal discovery.
+**CausalGBM** is a two-stage framework for fair tabular classification. Stage 1 learns a directed acyclic graph (DAG) over features, the protected attribute and the outcome with DAGMA, and scores each feature by predictive utility minus proxy strength. Stage 2 trains gradient boosting on the features that pass the score threshold. The result is a ranked list of *candidate proxy features* for audit, plus a classifier trained without them.
 
-> 📄 **Paper**: "CausalGBM: Achieving Fairness in Tabular Classification via Causal Feature Selection" (IJCAI 2026)
+> 📄 **Paper:** Divyansh Bhatia and N. Mehala. *CausalGBM: Achieving Fairness in Tabular Classification via Causal Feature Selection.* Proceedings of the 18th Asian Conference on Machine Learning (ACML 2026), PMLR 353, 2026.
 
-## 🎯 Key Results
 
-| Dataset | Baseline EOD | CausalGBM EOD | Reduction | AUC |
-|---------|-------------|---------------|-----------|-----|
-| ACS Income | 0.073 | 0.009 | **87%** | 0.86 |
-| Adult | 0.086 | 0.024 | **72%** | 0.87 |
-| Taiwan Credit | 0.034 | 0.019 | **46%** | 0.74 |
-| Synthetic Hiring | 0.256 | 0.042 | **84%** | 0.67 |
-| Synthetic Loan | 0.276 | 0.060 | **78%** | 0.65 |
+## Key results (camera-ready, Table 2)
 
-CausalGBM achieves **46-87% EOD reduction** while maintaining competitive accuracy, running **33-56× faster** than transformer alternatives.
+Mean over 10 seeds, 70/30 stratified splits, default configuration (α = 0.5, τ = 0.2, m = max(3, ⌊0.2d⌋)). EOD = Equalized Odds Difference (lower is fairer).
 
-## 📋 Overview
+| Dataset | XGBoost EOD | CausalGBM EOD | Reduction | CausalGBM AUC | Significant (p < 0.05) |
+|---|---|---|---|---|---|
+| ACS Income | 0.071 | **0.008** | 85%† | 0.859 | ✓ |
+| Adult | 0.067 | **0.030** | 55% | 0.868 | ✓ |
+| Synth. Loan | 0.303 | **0.049** | 84% | 0.646 | ✓ |
+| Synth. Hiring | 0.244 | **0.049** | 80% | 0.673 | ✓ |
+| COMPAS | 0.189 | **0.162** | 14% | 0.679 | ✓ (not after Nadeau–Bengio correction) |
+| Taiwan Credit | 0.030 | **0.019** | 37% | 0.742 | – |
+| Student Perf. | 0.161 | **0.103** | 36% | 0.705 | – |
+| Bank | 0.096 | 0.085 | 11% | 0.940 | – |
+| Online Shoppers | 0.023 | 0.026 | −13% | 0.881 | – |
+| German | 0.097 | 0.097 | 0% (rollback) | 0.782 | – |
 
-### The Problem
-Machine learning models can perpetuate bias through **proxy features**—variables that correlate with outcomes primarily through their association with protected attributes (e.g., zip code proxying for race in lending).
+† Relative to XGBoost trained without RAC1P, a near-copy of the protected attribute (EOD = 0.052). Relative to the full-feature XGBoost row the reduction is 89%.
 
-### Our Solution
-CausalGBM uses causal discovery to automatically identify these proxy features:
+Across 10 datasets and 17 baselines (including FairGBM and M²FGB), CausalGBM has the lowest EOD on 7 of 10 at default configurations, at a relative AUC cost of 3–14%. At matched AUC, in-processing methods remain competitive on several datasets: the advantage is regime-dependent (proxy-driven unfairness favours CausalGBM; label bias, e.g. COMPAS, favours in-processing). Runtime is 1.9 s (Adult) and 5.6 s (ACS Income), 33–56× faster than transformer baselines.
 
-```
-Stage 1: Learn DAG via DAGMA → Identify proxy features (A → X edges)
-Stage 2: Train gradient boosting on non-proxy features only
-```
-
-### Why It Works
-- **DAG-based detection** captures proxies that correlation misses
-- **Max-aggregation** combines DAG + correlation for robustness
-- **Scoring function** balances proxy removal with predictive value retention
-
-## 🏗️ Architecture
+## How it works
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      CausalGBM Framework                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
-│  │   Features  │───▶│  DAGMA      │───▶│  Learned    │     │
-│  │   X, A, Y   │    │  Structure  │    │  DAG W      │     │
-│  └─────────────┘    │  Learning   │    └──────┬──────┘     │
-│                     └─────────────┘           │            │
-│                                               ▼            │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
-│  │ Correlation │───▶│    Max      │───▶│  Scoring    │     │
-│  │   |ρ(X,A)|  │    │ Aggregation │    │  Function   │     │
-│  └─────────────┘    │  W' = max   │    │  c = W_XY   │     │
-│                     └─────────────┘    │    - αW'    │     │
-│                                        └──────┬──────┘     │
-│                                               │            │
-│                                               ▼            │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
-│  │  Selected   │◀───│  Threshold  │◀───│  Feature    │     │
-│  │  Features   │    │   τ = 0.2   │    │  Scores     │     │
-│  └──────┬──────┘    └─────────────┘    └─────────────┘     │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌─────────────┐                                           │
-│  │  XGBoost    │───▶  Fair Predictions                     │
-│  │  Training   │                                           │
-│  └─────────────┘                                           │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+Stage 1  Z = [X, A, Y]  ──DAGMA──▶  weighted DAG  W
+         proxy strength   W'_{A→Xj} = max(|W_{A→Xj}|, |corr(Xj, A)|)
+         score            c_j = W_{Xj→Y} − α · W'_{A→Xj}
+         keep             K = { j : c_j ≥ τ }, at least m = max(3, ⌊0.2d⌋) features
+Stage 2  train XGBoost on X[:, K]
+         if cross-validated AUC < 0.60 → roll back to all features
 ```
 
-## 🚀 Quick Start
+- **DAG-based detection** ranks features by joint conditional predictive utility rather than marginal correlation, which is where most of the gain comes from (ablation: DAGMA beats independent OLS/Lasso/Ridge on 6/8 datasets).
+- **Max-aggregation** gives a conservative association floor when the learned edge weight is unreliable (e.g. categorical features in a linear SEM). It cannot suppress a spurious correlation; whether such a feature is retained depends on its predictive-utility term and the minimum-feature rule.
+- **Minimum-feature floor and AUC rollback** prevent model collapse under aggressive removal.
 
-### Installation
+The method detects only *direct* proxies (A → X → Y). Indirect proxies on longer paths are a documented limitation (paper §4.10); the bottleneck is structure learning, not the scoring rule.
+
+## Quick start
 
 ```bash
-# Clone repository
-git clone https://github.com/DivyanshBhatia/CausalGBM.git
+git clone https://github.com/dnbresearch/CausalGBM.git
 cd CausalGBM
-
-# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
-
-# Install dependencies
+source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
-
-### Basic Usage
 
 ```python
 from causalgbm import CausalGBM
 
-# Initialize
 model = CausalGBM(
-    alpha=0.5,        # Fairness-accuracy tradeoff
-    tau=0.2,          # Score threshold
-    min_features=3    # Minimum features to retain
+    alpha=0.5,          # proxy penalty weight
+    tau=0.2,            # score threshold
+    min_features=None,  # defaults to max(3, floor(0.2 * d))
 )
-
-# Fit (X=features, A=protected attribute, y=target)
-model.fit(X_train, A_train, y_train)
-
-# Predict
+model.fit(X_train, A_train, y_train)      # A = protected attribute (binary)
 y_pred = model.predict(X_test)
 
-# Get selected features
-selected = model.get_selected_features()
-print(f"Selected features: {selected}")
-print(f"Removed proxies: {model.get_removed_features()}")
+print("Selected:", model.get_selected_features())
+print("Candidate proxies removed:", model.get_removed_features())
 ```
 
-## 📁 Project Structure
+The removed list is an **audit aid, not a certificate**: on real data these are candidates for human review, and removing them does not guarantee fairness when unfairness comes from the labels or from indirect paths the DAG does not recover.
+
+## Repository layout
 
 ```
 CausalGBM/
-├── models.py                       # CausalGBM implementation
-├── data_utils.py                   # Data loading and preprocessing
-├── training.py                     # Training and evaluation utilities
-├── causalgbm_experiments_v2.py     # Main experiment runner (reproduces Table 2)
-├── run_experiment.py               # Single experiment runner
-├── complete_benchmark.py           # Full benchmark suite
-├── analysis.py                     # Results analysis and visualization
-├── dag_visualization.py            # DAG visualization tools
-├── min_features_ablation.py        # Hyperparameter ablation studies
-├── demo.py                         # Quick demonstration
-├── evaluate_indirect_proxy.py      # Indirect proxy limitation analysis (Appendix L)
-├── synthetic_loan_data.csv         # Synthetic loan dataset (direct proxies)
-├── synthetic_hiring_data.csv       # Synthetic hiring dataset (direct proxies)
-├── synthetic_indirect_proxy_loan.csv # Synthetic dataset with indirect proxies (Appendix L)
-├── requirements.txt                # Python dependencies
-└── README.md                       # This file
+├── models.py                        # CausalGBM implementation
+├── data_utils.py                    # Data loading and preprocessing
+├── training.py                      # Training and evaluation utilities
+├── causalgbm_experiments_v2.py      # Main experiment runner
+├── run_experiment.py                # Single experiment runner
+├── complete_benchmark.py            # Full benchmark suite
+├── analysis.py                      # Results analysis and visualization
+├── dag_visualization.py             # DAG visualization tools
+├── min_features_ablation.py         # Min-feature floor ablation
+├── evaluate_indirect_proxy.py       # Indirect-proxy limitation analysis (paper §4.10)
+├── demo.py                          # Quick demonstration
+├── synthetic_loan_data.csv          # Synthetic loan dataset (direct proxies)
+├── synthetic_hiring_data.csv        # Synthetic hiring dataset (direct proxies)
+├── synthetic_indirect_proxy_loan.csv# Synthetic loan dataset with indirect proxies
+├── requirements.txt
+└── README.md
 ```
 
-## 📊 Datasets
+## Datasets
 
-### Included Synthetic Datasets
+**Real-world (Table 1 in the paper).** ACS Income is from Folktables (Ding et al., 2021); Adult, Bank Marketing, Taiwan Credit, Online Shoppers, German Credit and Student Performance are from the UCI repository; COMPAS is the ProPublica release. Multi-category protected attributes are binarised (COMPAS: African-American vs. other; ACS Income: White vs. non-White from RAC1P, which stays in X as a feature). The *Weekend* attribute on Online Shoppers is not a legally protected attribute; it is included as a sensitivity test.
 
-| Dataset | n | Description | Purpose |
-|---------|---|-------------|---------|
-| `synthetic_loan_data.csv` | 10,000 | Loan approval with direct proxies | Validation (Section 4.4) |
-| `synthetic_hiring_data.csv` | 10,000 | Hiring decisions with direct proxies | Validation (Section 4.4) |
-| `synthetic_indirect_proxy_loan.csv` | 10,000 | Loan approval with **indirect** proxies | Limitation analysis (Appendix L) |
+| Dataset | n | d | Protected | Baseline EOD |
+|---|---|---|---|---|
+| ACS Income | 195,665 | 10 | Race | 0.071 |
+| Adult | 48,842 | 11 | Sex | 0.067 |
+| Bank | 41,188 | 20 | Age | 0.096 |
+| Taiwan Credit | 30,000 | 22 | Sex | 0.030 |
+| Online Shoppers | 12,330 | 17 | Weekend | 0.023 |
+| COMPAS | 5,278 | 6 | Race | 0.189 |
+| German | 1,000 | 20 | Sex | 0.097 |
+| Student Perf. | 649 | 29 | Sex | 0.161 |
 
-### Indirect Proxy Dataset (Appendix L)
+**Synthetic (included).** Both have known ground-truth structure with three feature types: legitimate causes of Y, proxies mediating A → Y, and spurious correlates linked to A only through an unobserved confounder C (no path to Y).
 
-The `synthetic_indirect_proxy_loan.csv` dataset is specifically designed to test Definition 1's limitation—CausalGBM's inability to detect indirect proxies.
+| File | n | d | Purpose |
+|---|---|---|---|
+| `synthetic_loan_data.csv` | 10,000 | 8 | Validation (paper §4.7) |
+| `synthetic_hiring_data.csv` | 10,000 | 10 | Validation (paper §4.7, Figure 3) |
+| `synthetic_indirect_proxy_loan.csv` | 10,000 | — | Indirect-proxy limitation (paper §4.10) |
 
-**Ground Truth Causal Structure:**
-```
-Race (A) ──► Zip_Code_Risk ──► Loan_Approved (Y)
-   │              │                    ▲
-   │              ▼                    │
-   │         Property_Value ───────────┤  (indirect proxy, |ρ|=0.06)
-   │                                   │
-   └───────► School_Rating ────────────┤
-                  │                    │
-                  ▼                    │
-             Branch_Quality ───────────┘  (indirect proxy, |ρ|=0.10)
+On the two validation sets CausalGBM removes every ground-truth proxy and retains every spurious correlate across all 10 seeds, whereas correlation-based selection (|ρ| > 0.3) removes 2/2 spurious correlates on Synth. Loan, sacrificing 8% AUC for no fairness benefit.
 
-Legitimate: Annual_Income, Employment_Years, Credit_Score
-Spurious:   Name_Pattern (correlated but no path to Y)
-```
+The indirect-proxy set has 2 direct proxies, 2 indirect proxies (both with |ρ| < 0.1 to A) and 3 legitimate features. CausalGBM reaches EOD 0.079 vs. 0.092 for an oracle that removes exactly the four proxies, because it additionally drops a low-value spurious correlate; influence-propagation variants (total effects, k-hop, max-propagation) do not help, because DAGMA's linear SEM assigns zero weight to feature-to-feature edges.
 
-**Key Finding:** CausalGBM achieves 19% EOD reduction vs Oracle's 63%, with a 70% Indirect Gap. This validates the stated limitation when indirect proxies have low correlation (|ρ| < 0.1).
+## Hyperparameters
 
-### Supported Real-World Datasets
-| Dataset | n | d | Protected | Domain |
-|---------|---|---|-----------|--------|
-| Adult | 48,842 | 11 | Sex | Census |
-| ACS Income | 195,665 | 10 | Race | Census |
-| COMPAS | 5,278 | 6 | Race | Criminal Justice |
-| German Credit | 1,000 | 20 | Sex | Finance |
-| Taiwan Credit | 30,000 | 22 | Sex | Finance |
-| Bank Marketing | 41,188 | 20 | Age | Marketing |
-| Online Shoppers | 12,330 | 17 | Weekend | E-commerce |
+| Parameter | Default | Notes |
+|---|---|---|
+| `alpha` | 0.5 | Proxy penalty. Selections are identical for α ∈ [0.25, 3.0] at the default τ; EOD varies < 0.025 for α ∈ [0.25, 1.0] across 5 datasets. In practice α acts as a hard threshold; use τ or `min_features` for fine control. |
+| `tau` | 0.2 | Score threshold. |
+| `min_features` | max(3, ⌊0.2d⌋) | Floor on retained features. ⌊0.2d⌋ and ⌊d/3⌋ coincide (m = 3) on ACS, Adult, COMPAS and both synthetics; on larger-d datasets the floor trades AUC against EOD and should be validated per dataset. |
+| `dag_iterations` | 500 | DAGMA iterations. |
+| rollback threshold | 0.60 | Cross-validated AUC below which all features are restored. |
 
-## 🔧 Configuration
+## When to use it
 
-### Key Hyperparameters
+Use CausalGBM when baseline EOD exceeds ~0.03 and unfairness is at least partly proxy-driven. In the paper's benchmarks, three signals available before deployment each predicted a failure case:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `alpha` | 0.5 | Fairness penalty weight (higher = more fairness) |
-| `tau` | 0.2 | Score threshold for feature selection |
-| `min_features` | 3 | Minimum features to retain |
-| `dag_iterations` | 500 | DAGMA optimization iterations |
-| `dag_lambda` | 0.1 | DAG sparsity regularization |
+- baseline EOD below 0.03 (Online Shoppers: removal cannot help),
+- n below 5,000 (German, Student Performance: DAG unreliable, AUC degrades),
+- cross-validated AUC below 0.60 after selection (German: rollback).
 
-### Robustness
-Results are stable across wide hyperparameter ranges:
-- EOD varies <0.025 for α ∈ [0.25, 2.0]
-- EOD varies <0.02 for τ ∈ [0.1, 0.5]
+When unfairness stems from label bias (e.g. COMPAS), in-processing methods such as FairGBM achieve better fairness at matched AUC. Monitor worst-group accuracy alongside EOD: proxy removal can reduce predictive power for the worst-off group (ACS WGA 0.822 → 0.777).
 
----
+**Known limitations:** only direct A → X proxies; linear SEM may miss nonlinear proxies; DAGs identified only up to Markov equivalence; O(d³) DAGMA cost is prohibitive for d > 100; single binary protected attribute.
 
-## 📈 Reproducing Paper Results
+## Reproducing the paper
 
-### Command Line Interface
+All paper results use **10 seeds** unless stated otherwise (the structure-learning comparison in §4.5 uses 5). Every feature-selection step — standardisation, DAG learning, scoring, thresholding, the minimum-feature rule and the rollback check — uses training data only; the test split is used solely for reporting.
 
-The main experiment script `causalgbm_experiments_v2.py` supports the following arguments:
+<!-- AUTHORS: confirm each script → table mapping. Entries marked (?) are
+     inferred from file names and must be checked against the tagged commit. -->
+
+| Paper artefact | Script | Notes |
+|---|---|---|
+| Table 2 (CausalGBM vs XGBoost) | `causalgbm_experiments_v2.py --main_comparison` | |
+| Table 3 (vs FairGBM, M²FGB) | `causalgbm_experiments_v2.py --main_comparison` (?) | baselines at published defaults |
+| Table 4 (matched-AUC, SeqSel) | `acml_matched_auc.py` (?) | interpolated on sampled frontiers |
+| Table 5 (DAGMA vs regression) | `acml_regression_ablation.py` (?) | rank-normalised scoring |
+| Acyclicity ablation (§4.4) | `acml_acyclicity_ablation.py` (?) | |
+| Aggregation ablation (§4.4) | `causalgbm_experiments_v2.py --ablation` | |
+| Structure-learning comparison (§4.5) | (?) | 6 algorithms, 5 seeds, 3 datasets |
+| Hyperparameter validation (§4.6) | `causalgbm_experiments_v2.py --sensitivity`, `min_features_ablation.py` | |
+| Synthetic validation (§4.7) | `causalgbm_experiments_v2.py --dag_recovery` | |
+| Indirect-proxy analysis (§4.10) | `evaluate_indirect_proxy.py` | |
+| Figure 2 (Pareto frontiers) | (?) | α, λ, γ sweeps |
+
+### Command-line interface (`causalgbm_experiments_v2.py`)
 
 | Argument | Description | Default |
-|----------|-------------|---------|
-| `--all` | Run all experiments | False |
-| `--main_comparison` | Run main method comparison | False |
-| `--dag_recovery` | Run DAG recovery analysis on synthetic data | False |
-| `--sensitivity` | Run hyperparameter sensitivity analysis | False |
-| `--ablation` | Run ablation study (DAG vs Correlation) | False |
-| `--datasets` | List of datasets to use | all datasets |
-| `--synthetic_loan_path` | Path to synthetic loan CSV | auto-detect |
-| `--synthetic_hiring_path` | Path to synthetic hiring CSV | auto-detect |
-| `--output_dir` | Directory for results | `results/` |
-| `--device` | Compute device | `cuda` |
-| `--quick` | Quick mode (2 seeds instead of 5) | False |
-| `--max_samples` | Max samples per dataset | 200000 |
-
----
-
-### 🏃 Run Commands
-
-#### **1. Full Experiment Suite (All Results)**
-Reproduce all paper results including Table 2, ablations, and sensitivity analysis:
+|---|---|---|
+| `--all` | Run all experiments | off |
+| `--main_comparison` | Main method comparison | off |
+| `--dag_recovery` | DAG recovery on synthetic data | off |
+| `--sensitivity` | Hyperparameter sensitivity | off |
+| `--ablation` | Aggregation ablation (DAG / correlation / max) | off |
+| `--datasets` | Datasets to run | all |
+| `--synthetic_loan_path`, `--synthetic_hiring_path` | Paths to synthetic CSVs | auto-detect |
+| `--output_dir` | Results directory | `results/` |
+| `--device` | `cuda` or `cpu` | `cuda` |
+| `--quick` | Reduced seed count for smoke tests | off |
+| `--max_samples` | Cap on samples per dataset | 200000 |
 
 ```bash
-# Full experiments with GPU (recommended)
-python causalgbm_experiments_v2.py --all --device cuda --output_dir results/full
-
-# Full experiments with CPU only
-python causalgbm_experiments_v2.py --all --device cpu --output_dir results/full
-```
-
-#### **2. Main Comparison Only (Table 2)**
-Compare CausalGBM against all baselines:
-
-```bash
-# All datasets
-python causalgbm_experiments_v2.py --main_comparison --output_dir results/main
-
-# Specific datasets only
-python causalgbm_experiments_v2.py --main_comparison \
-    --datasets adult compas german acs_income \
-    --output_dir results/main
-
-# Quick test (2 seeds)
+# Smoke test (a few minutes)
 python causalgbm_experiments_v2.py --main_comparison --quick \
-    --datasets adult compas \
-    --output_dir results/quick_test
-```
+    --datasets adult synthetic_loan --output_dir results/smoke
 
-#### **3. DAG Recovery Analysis (Synthetic Data)**
-Evaluate causal structure recovery on synthetic datasets with known ground truth:
+# Full main comparison (Table 2; several hours on CPU)
+python causalgbm_experiments_v2.py --main_comparison --output_dir results/table2
 
-```bash
-# Run DAG recovery on synthetic datasets
-python causalgbm_experiments_v2.py --dag_recovery \
-    --datasets synthetic_loan synthetic_hiring \
-    --output_dir results/dag_recovery
+# Synthetic validation and aggregation ablation
+python causalgbm_experiments_v2.py --dag_recovery --ablation \
+    --datasets synthetic_loan synthetic_hiring --output_dir results/synthetic
 
-# With custom data paths
-python causalgbm_experiments_v2.py --dag_recovery \
-    --datasets synthetic_loan synthetic_hiring \
-    --synthetic_loan_path /path/to/synthetic_loan_data.csv \
-    --synthetic_hiring_path /path/to/synthetic_hiring_data.csv \
-    --output_dir results/dag_recovery
-```
-
-#### **4. Ablation Study (DAG vs Correlation)**
-Compare different aggregation strategies:
-
-```bash
-# Ablation on all datasets
-python causalgbm_experiments_v2.py --ablation --output_dir results/ablation
-
-# Ablation on specific datasets
-python causalgbm_experiments_v2.py --ablation \
-    --datasets adult acs_income synthetic_loan \
-    --output_dir results/ablation
-```
-
-#### **5. Sensitivity Analysis**
-Test hyperparameter sensitivity (α, τ, λ_dag, λ_sp, iterations):
-
-```bash
-# Full sensitivity analysis
-python causalgbm_experiments_v2.py --sensitivity --output_dir results/sensitivity
-
-# Quick sensitivity test
-python causalgbm_experiments_v2.py --sensitivity --quick \
-    --datasets adult german \
-    --output_dir results/sensitivity_quick
-```
-
-#### **6. Combined Experiments**
-
-```bash
-# Main comparison + ablation
-python causalgbm_experiments_v2.py --main_comparison --ablation \
-    --output_dir results/comparison_ablation
-
-# DAG recovery + sensitivity on synthetic data
-python causalgbm_experiments_v2.py --dag_recovery --sensitivity \
-    --datasets synthetic_loan synthetic_hiring \
-    --output_dir results/synthetic_analysis
-
-# Everything except sensitivity (faster)
-python causalgbm_experiments_v2.py --main_comparison --dag_recovery --ablation \
-    --output_dir results/no_sensitivity
-```
-
-#### **7. Resource-Constrained Settings**
-
-```bash
-# Low memory (limit samples)
-python causalgbm_experiments_v2.py --all --max_samples 10000 \
-    --output_dir results/low_mem
-
-# CPU only with reduced load
-python causalgbm_experiments_v2.py --main_comparison --quick \
-    --device cpu --max_samples 20000 \
-    --datasets adult compas german \
-    --output_dir results/cpu_quick
-
-# Single dataset quick test
-python causalgbm_experiments_v2.py --main_comparison --quick \
-    --datasets adult --output_dir results/test_adult
-```
-
----
-
-### 📁 Output Files
-
-After running experiments, the following files are generated in `--output_dir`:
-
-| File | Description |
-|------|-------------|
-| `main_comparison_results.csv` | Full results for all methods/datasets/seeds |
-| `dag_recovery_results.csv` | DAG structure recovery metrics (SHD, F1, etc.) |
-| `feature_selection_results.csv` | Causal vs spurious feature selection accuracy |
-| `ablation_results.csv` | Aggregation strategy comparison |
-| `sensitivity_analysis_results.csv` | Hyperparameter sensitivity results |
-| `experiment_summary.txt` | Human-readable summary of all experiments |
-
----
-
-### 📊 Example: Complete Reproducibility Pipeline
-
-```bash
-# Step 1: Quick validation (5 min)
-python causalgbm_experiments_v2.py --main_comparison --quick \
-    --datasets adult synthetic_loan \
-    --output_dir results/validation
-
-# Step 2: Full main results (2-4 hours)
-python causalgbm_experiments_v2.py --main_comparison \
-    --output_dir results/table2
-
-# Step 3: DAG recovery analysis (30 min)
-python causalgbm_experiments_v2.py --dag_recovery \
-    --datasets synthetic_loan synthetic_hiring \
-    --output_dir results/dag_analysis
-
-# Step 4: Ablation studies (1-2 hours)
-python causalgbm_experiments_v2.py --ablation \
-    --output_dir results/ablation
-
-# Step 5: Sensitivity analysis (3-4 hours)
-python causalgbm_experiments_v2.py --sensitivity \
-    --datasets adult acs_income german \
-    --output_dir results/sensitivity
-
-# Step 6: View summary
-cat results/table2/experiment_summary.txt
-```
-
----
-
-### Indirect Proxy Analysis (Appendix L)
-
-```bash
-# Run indirect proxy limitation analysis
+# Indirect-proxy analysis
 python evaluate_indirect_proxy.py
 ```
 
-## 🔬 Understanding the Results
+Outputs are written to `--output_dir`: `main_comparison_results.csv`, `dag_recovery_results.csv`, `feature_selection_results.csv`, `ablation_results.csv`, `sensitivity_analysis_results.csv` and a human-readable `experiment_summary.txt`.
 
-### Feature Analysis Output
+### Reading the feature analysis
 
 ```
-Feature Analysis on Adult Dataset:
-──────────────────────────────────────────────────────────────
-Feature          |ρ|     W_A→X    W_X→Y    Score    Selected
-──────────────────────────────────────────────────────────────
-relationship    0.65     0.82     0.31    -0.10       ✗
-marital-status  0.45     0.56     0.28    +0.00       ✗
-education       0.12     0.08     0.45    +0.41       ✓
-occupation      0.18     0.15     0.38    +0.30       ✓
-hours-per-week  0.08     0.05     0.22    +0.19       ✓
-age             0.06     0.04     0.35    +0.33       ✓
-──────────────────────────────────────────────────────────────
-Selected: 4/6 features | Removed proxies: relationship, marital-status
+Feature          |ρ(X,A)|   W_A→X    W_X→Y    score    selected
+relationship      0.65     0.82     0.31    -0.10       ✗
+marital-status    0.45     0.56     0.28     0.00       ✗
+education         0.12     0.08     0.45    +0.41       ✓
+occupation        0.18     0.15     0.38    +0.30       ✓
+hours-per-week    0.08     0.05     0.22    +0.19       ✓
+age               0.06     0.04     0.35    +0.33       ✓
 ```
 
-### Interpreting Scores
-- **Negative score**: Proxy signal > predictive value → Remove
-- **Positive score**: Predictive value > proxy signal → Keep
-- **High |ρ| but positive score**: Feature is predictive despite correlation
+A feature is kept when its predictive weight outweighs α times its proxy strength. A high |ρ| with a positive score means the feature is predictive despite its association with A — on ACS Income, SCHL (education) has W' = 0.072 but W_X→Y = 0.889 and is correctly retained.
 
-### DAG Recovery Metrics (Synthetic Data)
-
-| Metric | Description |
-|--------|-------------|
-| SHD | Structural Hamming Distance (lower is better) |
-| Precision | Fraction of learned edges that are true edges |
-| Recall | Fraction of true edges that were learned |
-| F1 | Harmonic mean of precision and recall |
-| Causal F1 | F1 for selecting truly causal features |
-| Spurious Rejection | Rate of correctly rejecting spurious features |
-
-## ⚠️ Limitations & When to Use
-
-### ✅ Use CausalGBM When:
-- Baseline EOD > 0.03 (meaningful unfairness exists)
-- Sample size n > 1,000 (preferably n > 3,000)
-- Unfairness stems from proxy features
-
-### ❌ Avoid CausalGBM When:
-- EOD < 0.02 (already fair)
-- n < 1,000 (DAG learning unreliable)
-- Unfairness from label bias (e.g., COMPAS)
-
-### Known Limitations
-1. **Indirect proxies**: Only detects direct A→X edges (see Appendix L)
-2. **Linear assumption**: DAGMA may miss nonlinear relationships
-3. **Scalability**: O(d³) cost prohibitive for d > 100 features
-
-## 📚 Citation
+## Citation
 
 ```bibtex
-@inproceedings{causalgbm2026,
-  title={CausalGBM: Achieving Fairness in Tabular Classification via Causal Feature Selection},
-  author={Anonymous},
-  booktitle={Submitted to Proceedings of the International Joint Conference on Artificial Intelligence (IJCAI)},
-  year={2026}
+@inproceedings{bhatia2026causalgbm,
+  title     = {{CausalGBM}: Achieving Fairness in Tabular Classification via Causal Feature Selection},
+  author    = {Bhatia, Divyansh and Mehala, N.},
+  booktitle = {Proceedings of the 18th Asian Conference on Machine Learning (ACML 2026)},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {353},
+  publisher = {PMLR},
+  year      = {2026}
 }
 ```
 
-## 📖 References
+## References
 
-1. **DAGMA**: Bello et al. (2022). "DAGMA: Learning DAGs via M-matrices and a Log-Determinant Acyclicity Characterization"
-2. **XGBoost**: Chen & Guestrin (2016). "XGBoost: A Scalable Tree Boosting System"
-3. **Equalized Odds**: Hardt et al. (2016). "Equality of Opportunity in Supervised Learning"
-4. **Counterfactual Fairness**: Kusner et al. (2017). "Counterfactual Fairness"
+- Bello, Aragam, Ravikumar (2022). DAGMA: Learning DAGs via M-matrices and a log-determinant acyclicity characterization. NeurIPS.
+- Chen, Guestrin (2016). XGBoost: A scalable tree boosting system. KDD.
+- Hardt, Price, Srebro (2016). Equality of opportunity in supervised learning. NeurIPS.
+- Cruz, Belém, Bravo, Saleiro, Bizarro (2023). FairGBM: Gradient boosting with fairness constraints. ICLR.
+- Pereira, Valdrighi, Raimundo (2025). M²FGB: A min-max gradient boosting framework for subgroup fairness. FAccT.
+- Galhotra, Shanmugam, Sattigeri, Varshney (2022). Causal feature selection for algorithmic fairness. SIGMOD.
 
-## 🤝 Contributing
+## Contributing
 
-Contributions welcome! Areas for improvement:
-- [ ] Nonlinear DAG learning (NOTEARS-MLP integration)
-- [ ] Multi-hop (indirect) proxy detection
-- [ ] Multiple protected attributes support
-- [ ] Online learning for distribution shift
-- [ ] Integration with other tree-based models (LightGBM, CatBoost)
+Directions we would welcome: nonlinear DAG learning (NOTEARS-MLP / DAGMA-MLP) for indirect proxies, multiple and intersectional protected attributes, and other tree learners (LightGBM, CatBoost — Stage 2 is classifier-agnostic).
 
-## 📄 License
+## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
 
-## 📧 Contact
+## Contact
 
-For questions or issues, please open a GitHub issue or contact the authors.
-
----
-
-**Note**: This is the official implementation accompanying the IJCAI 2026 paper submission. Code and samples will be fully released upon acceptance.
+Open a GitHub issue, or email dnbhatia@ebay.com / mehala.n@vidyashilp.edu.in.
